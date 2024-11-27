@@ -4,32 +4,20 @@ import (
 	"bufio"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/go-resty/resty/v2"
-	pgt "github.com/nicoxiang/geektime-downloader/internal/pkg/geektime"
-	"github.com/nicoxiang/geektime-downloader/internal/pkg/logger"
+	"github.com/nicoxiang/geektime-downloader/internal/geektime"
 )
 
 var (
-	client *resty.Client
 	// regex pattern for extracting `key=value` parameters from a line
 	linePattern = regexp.MustCompile(`([a-zA-Z-]+)=("[^"]+"|[^",]+)`)
 )
 
-func init() {
-	client = resty.New().
-		SetRetryCount(1).
-		SetTimeout(10*time.Second).
-		SetHeader(pgt.UserAgentHeaderName, pgt.UserAgentHeaderValue).
-		SetLogger(logger.DiscardLogger{})
-}
-
-// Parse do m3u8 url GET request, and extract ts file names and decrypt key from that
-func Parse(m3u8url string) (tsFileNames []string, keyURI string, err error) {
-	m3u8Resp, err := client.R().SetDoNotParseResponse(true).Get(m3u8url)
+// Parse do m3u8 url GET request, and extract ts file names and check if it's encrypt video
+func Parse(client *geektime.Client, m3u8url string) (tsFileNames []string, isVodEncryptVideo bool, err error) {
+	m3u8Resp, err := client.RestyClient.R().SetDoNotParseResponse(true).Get(m3u8url)
 	if err != nil {
-		return nil, "", err
+		return nil, false, err
 	}
 	defer m3u8Resp.RawBody().Close()
 	s := bufio.NewScanner(m3u8Resp.RawBody())
@@ -45,7 +33,7 @@ func Parse(m3u8url string) (tsFileNames []string, keyURI string, err error) {
 		if strings.HasPrefix(line, "#EXT-X-KEY") && !gotKeyURI {
 			// ONLY Method and URI, IV not present
 			params := parseLineParameters(line)
-			keyURI, gotKeyURI = params["URI"], true
+			isVodEncryptVideo, gotKeyURI = params["MEATHOD"] == "AES-128", true
 		}
 		if !strings.HasPrefix(line, "#") && strings.HasSuffix(line, ".ts") {
 			tsFileNames = append(tsFileNames, line)

@@ -2,29 +2,29 @@ package video
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io/ioutil"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cheggaaa/pb/v3"
-	"github.com/go-resty/resty/v2"
 	"github.com/google/uuid"
 	"github.com/nicoxiang/geektime-downloader/internal/geektime"
 	"github.com/nicoxiang/geektime-downloader/internal/pkg/crypto"
+	"github.com/nicoxiang/geektime-downloader/internal/pkg/downloader"
 	"github.com/nicoxiang/geektime-downloader/internal/pkg/filenamify"
-	pgt "github.com/nicoxiang/geektime-downloader/internal/pkg/geektime"
-	"github.com/nicoxiang/geektime-downloader/internal/pkg/logger"
+	"github.com/nicoxiang/geektime-downloader/internal/pkg/files"
 	"github.com/nicoxiang/geektime-downloader/internal/pkg/m3u8"
 	"github.com/nicoxiang/geektime-downloader/internal/video/vod"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
-	syncByte = uint8(71) //0x47
+	// syncByte = uint8(71) //0x47
+
 	// TSExtension ...
 	TSExtension = ".ts"
 )
@@ -32,33 +32,12 @@ const (
 // EncryptType enum
 type EncryptType int
 
-const (
-	// AliyunVodEncrypt ...
-	AliyunVodEncrypt EncryptType = iota
-	// HLSStandardEncrypt ...
-	HLSStandardEncrypt
-)
-
-var (
-	// make simple api call
-	client *resty.Client
-	// used to download video
-	downloadClient *resty.Client
-)
-
-func init() {
-	client = resty.New().
-		SetHeader(pgt.UserAgentHeaderName, pgt.UserAgentHeaderValue).
-		SetRetryCount(1).
-		SetTimeout(10 * time.Second).
-		SetLogger(logger.DiscardLogger{})
-
-	downloadClient = resty.New().
-		SetHeader(pgt.UserAgentHeaderName, pgt.UserAgentHeaderValue).
-		SetRetryCount(0).
-		SetTimeout(time.Minute).
-		SetLogger(logger.DiscardLogger{})
-}
+// const (
+// 	// AliyunVodEncrypt ...
+// 	AliyunVodEncrypt EncryptType = iota
+// 	// HLSStandardEncrypt ...
+// 	HLSStandardEncrypt
+// )
 
 // GetPlayInfoResponse is the response struct for api GetPlayInfo
 type GetPlayInfoResponse struct {
@@ -67,61 +46,150 @@ type GetPlayInfoResponse struct {
 	PlayInfoList vod.PlayInfoListInGetPlayInfo `json:"PlayInfoList" xml:"PlayInfoList"`
 }
 
-// DownloadAliyunVodEncryptVideo ...
-func DownloadAliyunVodEncryptVideo(ctx context.Context,
+// DownloadArticleVideo download normal video cource ...
+// sourceType: normal video cource 1
+func DownloadArticleVideo(ctx context.Context,
+	client *geektime.Client,
 	articleID int,
-	currentProduct geektime.Product,
+	sourceType int,
+	projectDir string,
+	quality string,
+	concurrency int,
+) error {
+
+	articleInfo, err := client.V3ArticleInfo(articleID)
+	if err != nil {
+		return err
+	}
+	if articleInfo.Data.Info.Video.ID == "" {
+		return nil
+	}
+	playAuth, err := client.VideoPlayAuth(articleInfo.Data.Info.ID, sourceType, articleInfo.Data.Info.Video.ID)
+	if err != nil {
+		return err
+	}
+	return downloadAliyunVodEncryptVideo(ctx,
+		client,
+		playAuth,
+		articleInfo.Data.Info.Title,
+		projectDir,
+		quality,
+		articleInfo.Data.Info.Video.ID,
+		concurrency)
+}
+
+// DownloadEnterpriseArticleVideo download enterprise video
+func DownloadEnterpriseArticleVideo(ctx context.Context,
+	client *geektime.Client,
+	articleID int,
+	projectDir string,
+	quality string,
+	concurrency int,
+) error {
+	articleInfo, err := client.V1EnterpriseArticleDetail(strconv.Itoa(articleID))
+	if err != nil {
+		return err
+	}
+	if articleInfo.Data.Video.ID == "" {
+		return nil
+	}
+	playAuth, err := client.EnterpriseVideoPlayAuth(strconv.Itoa(articleID), articleInfo.Data.Video.ID)
+	if err != nil {
+		return err
+	}
+	return downloadAliyunVodEncryptVideo(ctx,
+		client,
+		playAuth,
+		articleInfo.Data.Article.Title,
+		projectDir,
+		quality,
+		articleInfo.Data.Video.ID,
+		concurrency)
+}
+
+// DownloadUniversityVideo ...
+func DownloadUniversityVideo(ctx context.Context,
+	client *geektime.Client,
+	articleID int,
+	currentProduct geektime.Course,
 	projectDir string,
 	quality string,
 	concurrency int) error {
-	playAuthInfo, err := geektime.GetPlayAuth(articleID, currentProduct.ID)
+	playAuthInfo, err := client.UniversityVideoPlayAuth(articleID, currentProduct.ID)
 	if err != nil {
 		return err
 	}
+
+	videoTitle := getUniversityVideoTitle(articleID, currentProduct)
+	return downloadAliyunVodEncryptVideo(ctx,
+		client,
+		playAuthInfo.Data.PlayAuth,
+		videoTitle,
+		projectDir,
+		quality,
+		playAuthInfo.Data.VID,
+		concurrency)
+}
+
+func downloadAliyunVodEncryptVideo(ctx context.Context,
+	client *geektime.Client,
+	playAuth,
+	videoTitle,
+	projectDir,
+	quality,
+	videoID string,
+	concurrency int) error {
+
 	clientRand := uuid.NewString()
-	playInfoURL, err := vod.BuildVodGetPlayInfoURL(playAuthInfo.PlayAuth, playAuthInfo.VideoID, clientRand)
+	playInfoURL, err := vod.BuildVodGetPlayInfoURL(playAuth, videoID, clientRand)
 	if err != nil {
 		return err
 	}
-	playInfo, err := getPlayInfo(playInfoURL, quality)
+	playInfo, err := getPlayInfo(client, playInfoURL, quality)
 	if err != nil {
 		return err
 	}
 	tsURLPrefix := extractTSURLPrefix(playInfo.PlayURL)
-	// just ignore keyURI in m3u8, aliyun private vod use another decrypt method
-	tsFileNames, _, err := m3u8.Parse(playInfo.PlayURL)
+
+	tsFileNames, isVodEncryptVideo, err := m3u8.Parse(client, playInfo.PlayURL)
 	if err != nil {
 		return err
 	}
-	decryptKey := crypto.GetAESDecryptKey(clientRand, playInfo.Rand, playInfo.Plaintext)
-	title := getUniversityVideoTitle(articleID, currentProduct)
-	return download(ctx, tsURLPrefix, title, projectDir, tsFileNames, []byte(decryptKey), playInfo.Size, AliyunVodEncrypt, concurrency)
+
+	decryptKey := ""
+	if isVodEncryptVideo {
+		decryptKey = crypto.GetAESDecryptKey(clientRand, playInfo.Rand, playInfo.Plaintext)
+	}
+	return download(ctx, tsURLPrefix, videoTitle, projectDir, tsFileNames, []byte(decryptKey), playInfo.Size, isVodEncryptVideo, concurrency)
 }
 
-// DownloadHLSStandardEncryptVideo ...
-func DownloadHLSStandardEncryptVideo(ctx context.Context, m3u8url, title, projectDir string, size int64, concurrency int) (err error) {
-	tsURLPrefix := extractTSURLPrefix(m3u8url)
-	tsFileNames, keyURI, err := m3u8.Parse(m3u8url)
-	if err != nil {
-		return err
-	}
-	var decryptKey []byte
-	// Old version keyURI
-	// https://misc.geekbang.org/serv/v1/decrypt/decryptkms/?Ciphertext=longlongstring
-	if strings.HasPrefix(keyURI, "https://") || strings.HasPrefix(keyURI, "http://") {
-		resp, err := client.R().
-			SetContext(ctx).
-			SetHeader(pgt.OriginHeaderName, pgt.GeekBang).
-			Get(keyURI)
-		decryptKey = resp.Body()
-		if err != nil {
-			return err
-		}
-	} else {
-		return errors.New("unexpected m3u8 keyURI")
+// DownloadMP4 download MP4 resources in article
+func DownloadMP4(ctx context.Context, title, projectDir string, mp4URLs []string, overwrite bool) (err error) {
+	filenamifyTitle := filenamify.Filenamify(title)
+	videoDir := filepath.Join(projectDir, "videos", filenamifyTitle)
+	if err = os.MkdirAll(videoDir, os.ModePerm); err != nil {
+		return
 	}
 
-	return download(ctx, tsURLPrefix, title, projectDir, tsFileNames, decryptKey, size, HLSStandardEncrypt, concurrency)
+	for _, mp4URL := range mp4URLs {
+		u, _ := url.Parse(mp4URL)
+		dst := filepath.Join(videoDir, path.Base(u.Path))
+
+		if files.CheckFileExists(dst) && !overwrite {
+			continue
+		}
+
+		headers := make(map[string]string, 2)
+		headers[geektime.Origin] = geektime.DefaultBaseURL
+		headers[geektime.UserAgent] = geektime.DefaultUserAgent
+
+		_, err := downloader.DownloadFileConcurrently(ctx, dst, mp4URL, headers, 5)
+		if err != nil {
+			return nil
+		}
+	}
+
+	return
 }
 
 func download(ctx context.Context,
@@ -131,7 +199,7 @@ func download(ctx context.Context,
 	tsFileNames []string,
 	decryptKey []byte,
 	size int64,
-	videoEncryptType EncryptType,
+	isVodEncryptVideo bool,
 	concurrency int) (err error) {
 
 	// Make temp ts folder and download temp ts files
@@ -145,70 +213,35 @@ func download(ctx context.Context,
 		_ = os.RemoveAll(tempVideoDir)
 	}()
 
-	// classic bounded work pooling pattern
-	g, ctx := errgroup.WithContext(ctx)
-	ch := make(chan string, concurrency)
-
 	bar := newBar(size, fmt.Sprintf("[正在下载 %s] ", filenamifyTitle))
 	bar.Start()
 
-	downloadClient.SetOutputDirectory(tempVideoDir)
-
-	for i := 0; i < concurrency; i++ {
-		g.Go(func() error {
-			return writeToTempVideoFile(ctx, ch, bar, tsURLPrefix)
-		})
-	}
-
 	for _, tsFileName := range tsFileNames {
-		ch <- tsFileName
+		u := tsURLPrefix + tsFileName
+		dst := filepath.Join(tempVideoDir, tsFileName)
+
+		headers := make(map[string]string, 2)
+		headers[geektime.Origin] = geektime.DefaultBaseURL
+		headers[geektime.UserAgent] = geektime.DefaultUserAgent
+
+		fileSize, err := downloader.DownloadFileConcurrently(ctx, dst, u, headers, concurrency)
+		if err != nil {
+			return err
+		}
+
+		addBarValue(bar, fileSize)
 	}
-	close(ch)
-	err = g.Wait()
+
 	bar.Finish()
-	if err != nil {
-		return
-	}
 
 	// Read temp ts files, decrypt and merge into the one final video file
-	err = mergeTSFiles(tempVideoDir, filenamifyTitle, projectDir, decryptKey, videoEncryptType)
+	err = mergeTSFiles(tempVideoDir, filenamifyTitle, projectDir, decryptKey, isVodEncryptVideo)
 
 	return
 }
 
-func writeToTempVideoFile(ctx context.Context,
-	tsFileNames chan string,
-	bar *pb.ProgressBar,
-	tsURLPrefix string) (err error) {
-	for tsFileName := range tsFileNames {
-
-		// fix error: http2: server sent GOAWAY and closed the connection; LastStreamID=1999
-		// resty retry not work, because error comes from io read, not request
-		err := retry(5, 700*time.Millisecond, func() error {
-			resp, err := downloadClient.R().
-				SetContext(ctx).
-				SetHeader(pgt.OriginHeaderName, pgt.GeekBang).
-				SetOutput(tsFileName).
-				Get(tsURLPrefix + tsFileName)
-			if err != nil {
-				return err
-			}
-			addBarValue(bar, resp.Size())
-			return nil
-		})
-
-		if err != nil {
-			for range tsFileNames {
-			}
-			return err
-		}
-
-	}
-	return nil
-}
-
-func mergeTSFiles(tempVideoDir, filenamifyTitle, projectDir string, key []byte, videoEncryptType EncryptType) error {
-	tempTSFiles, err := ioutil.ReadDir(tempVideoDir)
+func mergeTSFiles(tempVideoDir, filenamifyTitle, projectDir string, key []byte, isVodEncryptVideo bool) error {
+	tempTSFiles, err := os.ReadDir(tempVideoDir)
 	if err != nil {
 		return err
 	}
@@ -221,25 +254,27 @@ func mergeTSFiles(tempVideoDir, filenamifyTitle, projectDir string, key []byte, 
 		return err
 	}
 	for _, tempTSFile := range tempTSFiles {
-		f, err := ioutil.ReadFile(filepath.Join(tempVideoDir, tempTSFile.Name()))
+		f, err := os.ReadFile(filepath.Join(tempVideoDir, tempTSFile.Name()))
 		if err != nil {
 			return err
 		}
-		switch videoEncryptType {
-		case HLSStandardEncrypt:
-			aes128 := crypto.AESDecryptCBC(f, key, make([]byte, 16))
-			// https://en.wikipedia.org/wiki/MPEG_transport_stream
-			for j := 0; j < len(aes128); j++ {
-				if aes128[j] == syncByte {
-					aes128 = aes128[j:]
-					break
-				}
-			}
-			f = aes128
-		case AliyunVodEncrypt:
+
+		if isVodEncryptVideo {
 			tsParser := m3u8.NewTSParser(f, string(key))
 			f = tsParser.Decrypt()
 		}
+
+		// case HLSStandardEncrypt:
+		// 	aes128 := crypto.AESDecryptCBC(f, key, make([]byte, 16))
+		// 	// https://en.wikipedia.org/wiki/MPEG_transport_stream
+		// 	for j := 0; j < len(aes128); j++ {
+		// 	if aes128[j] == syncByte {
+		// 		aes128 = aes128[j:]
+		// 		break
+		// 	}
+		// }
+		// f = aes128
+
 		if _, err := finalVideoFile.Write(f); err != nil {
 			return err
 		}
@@ -266,7 +301,7 @@ func addBarValue(bar *pb.ProgressBar, written int64) {
 	}
 }
 
-func getUniversityVideoTitle(articleID int, currentProduct geektime.Product) string {
+func getUniversityVideoTitle(articleID int, currentProduct geektime.Course) string {
 	for _, v := range currentProduct.Articles {
 		if v.AID == articleID {
 			return v.Title
@@ -280,11 +315,10 @@ func extractTSURLPrefix(m3u8url string) string {
 	return m3u8url[:i+1]
 }
 
-func getPlayInfo(playInfoURL, quality string) (vod.PlayInfo, error) {
+func getPlayInfo(client *geektime.Client, playInfoURL, quality string) (vod.PlayInfo, error) {
 	var getPlayInfoResp GetPlayInfoResponse
 	var playInfo vod.PlayInfo
-	_, err := client.R().
-		SetHeader(pgt.OriginHeaderName, pgt.GeekBangUniversity).
+	_, err := client.RestyClient.R().
 		SetResult(&getPlayInfoResp).
 		Get(playInfoURL)
 
@@ -299,18 +333,4 @@ func getPlayInfo(playInfoURL, quality string) (vod.PlayInfo, error) {
 		}
 	}
 	return playInfo, nil
-}
-
-func retry(attempts int, sleep time.Duration, f func() error) (err error) {
-	for i := 0; i < attempts; i++ {
-		if i > 0 {
-			time.Sleep(sleep)
-			sleep *= 2
-		}
-		err = f()
-		if err == nil || errors.Is(err, context.Canceled) {
-			return err
-		}
-	}
-	return fmt.Errorf("after %d attempts, last error: %s", attempts, err)
 }
